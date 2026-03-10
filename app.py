@@ -62,10 +62,16 @@ class DatabaseManager:
 # ==========================================
 class FinancialEngine:
     def __init__(self, data):
-        self.raw_data = dict(zip(data['Metric'], data['Value']))
+        # Support both Vertical (Metric/Value) and Horizontal datasets
+        if 'Metric' in data.columns and 'Value' in data.columns:
+            self.raw_data = dict(zip(data['Metric'], data['Value']))
+        else:
+            self.raw_data = data.iloc[0].to_dict()
+            
         self.extract_metrics()
 
     def extract_metrics(self):
+        # Using .get() ensures the app doesn't crash if a specific metric is missing
         self.current_assets = self.raw_data.get('Current Assets', 0)
         self.current_liabilities = self.raw_data.get('Current Liabilities', 0)
         self.inventory = self.raw_data.get('Inventory', 0)
@@ -133,6 +139,25 @@ class FinancialEngine:
         if score >= 80: return "Low Risk", "Highly Ready for Loan processing."
         elif score >= 50: return "Moderate Risk", "Requires collateral or structural review."
         else: return "High Risk", "Not recommended for standard lending at this time."
+        
+    def get_ratio_insights(self, ratios):
+        """NEW: Generates visual health indicators for the UI table"""
+        insights = []
+        for metric, val in ratios.items():
+            status = "🟡 Fair"
+            if metric == "Current Ratio":
+                status = "🟢 Healthy" if val >= 1.5 else ("🔴 High Risk" if val < 1.0 else status)
+            elif metric == "Debt-to-Equity":
+                status = "🟢 Healthy" if val <= 1.5 else ("🔴 High Risk" if val > 2.5 else status)
+            elif metric == "Net Profit Margin":
+                status = "🟢 Healthy" if val >= 0.10 else ("🔴 High Risk" if val <= 0 else status)
+            elif metric == "Altman Z-Score":
+                status = "🟢 Safe" if val > 2.9 else ("🔴 Distress" if val < 1.23 else "🟡 Grey Zone")
+            else:
+                status = "🟢 Healthy" if val >= 0.05 else ("🔴 High Risk" if val <= 0 else status)
+                
+            insights.append(status)
+        return insights
 
 # ==========================================
 # 3. REPORT GENERATOR
@@ -159,14 +184,16 @@ class ReportGenerator:
         for metric, value in ratios.items():
             pdf.cell(200, 10, txt=f"{metric}: {value:.2f}", ln=True)
             
-        # FIX: fpdf2 returns a bytearray natively, so we just convert it to bytes for Streamlit
         return bytes(pdf.output())
-        
+
 # ==========================================
 # 4. PERFORMANCE & STATE OPTIMIZATION
 # ==========================================
 @st.cache_data(show_spinner="Parsing Financials...")
 def load_excel_data(file):
+    # Support both Excel and CSV uploads seamlessly
+    if file.name.endswith('.csv'):
+        return pd.read_csv(file)
     return pd.read_excel(file)
 
 @st.cache_resource
@@ -215,7 +242,6 @@ if not st.session_state.logged_in:
 
 # --- MAIN APPLICATION UI ---
 st.sidebar.title(f"Welcome, {st.session_state.username}")
-
 page = st.sidebar.radio("Navigation", ["Scanner Dashboard", "Scan History"])
 
 if st.sidebar.button("Logout"):
@@ -226,17 +252,22 @@ if st.sidebar.button("Logout"):
 # --- PAGE: SCANNER DASHBOARD ---
 if page == "Scanner Dashboard":
     st.title("MSME Financial Health Scanner")
-    st.markdown("Upload your structured Excel file to analyze balance sheets and P&L statements.")
+    st.markdown("Upload your structured Excel or CSV file to analyze balance sheets and P&L statements.")
     
     company_name = st.text_input("Company Name")
-    uploaded_file = st.file_uploader("Upload Financial Data (Excel)", type=["xlsx", "xls"])
+    uploaded_file = st.file_uploader("Upload Financial Data", type=["xlsx", "xls", "csv"])
     
     if uploaded_file and company_name:
         try:
             df = load_excel_data(uploaded_file)
             
+            # NEW: Data Preview Expander
+            with st.expander("🔍 View Uploaded Raw Data"):
+                st.dataframe(df, use_container_width=True)
+            
             if 'current_file' not in st.session_state or st.session_state.current_file != uploaded_file.name:
                 engine = FinancialEngine(df)
+                st.session_state.engine = engine # Save engine for chart plotting
                 st.session_state.base_ratios = engine.calculate_ratios()
                 st.session_state.base_score = engine.calculate_bankability(st.session_state.base_ratios)
                 st.session_state.risk_level, st.session_state.rec = engine.get_risk_classification(st.session_state.base_score)
@@ -245,7 +276,8 @@ if page == "Scanner Dashboard":
                 st.session_state.stress_score = engine.calculate_bankability(st.session_state.stress_ratios)
                 st.session_state.current_file = uploaded_file.name
             
-            col1, col2 = st.columns([1, 1])
+            st.markdown("---")
+            col1, col2, col3 = st.columns([1.2, 1, 1])
             
             with col1:
                 st.subheader("Bankability Score")
@@ -267,9 +299,24 @@ if page == "Scanner Dashboard":
                 st.info(f"**Recommendation:** {st.session_state.rec}")
             
             with col2:
+                # NEW: Visual breakdown of Assets vs Liabilities
+                st.subheader("Financial Overview")
+                eng = st.session_state.engine
+                bar_fig = go.Figure(data=[
+                    go.Bar(name='Total Assets', x=['Core Financials'], y=[eng.total_assets], marker_color='green'),
+                    go.Bar(name='Total Liabilities', x=['Core Financials'], y=[eng.total_liabilities], marker_color='red'),
+                    go.Bar(name='Total Equity', x=['Core Financials'], y=[eng.total_equity], marker_color='blue')
+                ])
+                bar_fig.update_layout(barmode='group', margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(bar_fig, use_container_width=True)
+
+            with col3:
                 st.subheader("Key Ratios & Metrics")
                 metrics_df = pd.DataFrame(list(st.session_state.base_ratios.items()), columns=["Metric", "Value"])
                 metrics_df["Value"] = metrics_df["Value"].round(2)
+                
+                # NEW: Add visual health indicators to the table
+                metrics_df["Health Status"] = st.session_state.engine.get_ratio_insights(st.session_state.base_ratios)
                 st.dataframe(metrics_df, hide_index=True, use_container_width=True)
                 
             st.markdown("---")
@@ -292,7 +339,7 @@ if page == "Scanner Dashboard":
                 st.download_button(label="Download PDF Report", data=pdf_bytes, file_name=f"{company_name}_report.pdf", mime="application/pdf")
                 
         except Exception as e:
-            st.error(f"Error processing file. Please ensure it matches the required format. Details: {e}")
+            st.error(f"Error processing file. Please ensure it contains the required financial metrics. Technical Details: {e}")
 
 # --- PAGE: SCAN HISTORY ---
 elif page == "Scan History":
