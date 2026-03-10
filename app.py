@@ -3,7 +3,6 @@ import pandas as pd
 import sqlite3
 import datetime
 import hashlib
-import razorpay
 from fpdf import FPDF
 import plotly.graph_objects as go
 
@@ -16,7 +15,6 @@ class DatabaseManager:
         self.create_tables()
 
     def create_tables(self):
-        # Scan History Table
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,12 +25,10 @@ class DatabaseManager:
             scan_date TIMESTAMP
         )
         """)
-        # Users Table
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
-            password_hash TEXT,
-            is_paid INTEGER DEFAULT 0
+            password_hash TEXT
         )
         """)
         self.conn.commit()
@@ -45,7 +41,6 @@ class DatabaseManager:
     def get_history(self, username):
         return pd.read_sql_query("SELECT company_name, bankability_score, risk_classification, scan_date FROM scans WHERE username=? ORDER BY scan_date DESC", self.conn, params=(username,))
 
-    # User Auth Methods
     def create_user(self, username, password):
         hashed_pw = hashlib.sha256(password.encode()).hexdigest()
         try:
@@ -53,34 +48,121 @@ class DatabaseManager:
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
-            return False # Username exists
+            return False 
 
     def verify_user(self, username, password):
         hashed_pw = hashlib.sha256(password.encode()).hexdigest()
-        cursor = self.conn.execute("SELECT is_paid FROM users WHERE username=? AND password_hash=?", (username, hashed_pw))
-        result = cursor.fetchone()
-        if result:
-            return {"authenticated": True, "is_paid": bool(result[0])}
-        return {"authenticated": False, "is_paid": False}
-
-    def upgrade_user(self, username):
-        self.conn.execute("UPDATE users SET is_paid=1 WHERE username=?", (username,))
-        self.conn.commit()
+        cursor = self.conn.execute("SELECT username FROM users WHERE username=? AND password_hash=?", (username, hashed_pw))
+        if cursor.fetchone():
+            return True
+        return False
 
 # ==========================================
-# 2. FINANCIAL & REPORT ENGINE (Abstracted for brevity)
+# 2. FINANCIAL ENGINE
 # ==========================================
-# [Keep your existing FinancialEngine and ReportGenerator classes here exactly as they were in V2]
 class FinancialEngine:
-    # ... (Insert V2 logic here) ...
-    pass
+    def __init__(self, data):
+        self.raw_data = dict(zip(data['Metric'], data['Value']))
+        self.extract_metrics()
 
-class ReportGenerator:
-    # ... (Insert V2 logic here) ...
-    pass
+    def extract_metrics(self):
+        self.current_assets = self.raw_data.get('Current Assets', 0)
+        self.current_liabilities = self.raw_data.get('Current Liabilities', 0)
+        self.inventory = self.raw_data.get('Inventory', 0)
+        self.total_liabilities = self.raw_data.get('Total Liabilities', 0)
+        self.total_equity = self.raw_data.get('Total Equity', 0)
+        self.net_income = self.raw_data.get('Net Income', 0)
+        self.revenue = self.raw_data.get('Revenue', 0)
+        self.total_assets = self.raw_data.get('Total Assets', 0)
+        self.ebit = self.raw_data.get('EBIT', 0)
+        self.retained_earnings = self.raw_data.get('Retained Earnings', 0)
+        self.interest_expense = self.raw_data.get('Interest Expense', 0)
+        
+        self.working_capital = self.current_assets - self.current_liabilities
+        self.total_debt = self.total_liabilities 
+
+    def calculate_ratios(self, apply_stress=False, revenue_drop=0.0, rate_hike=0.0):
+        rev = self.revenue * (1 - revenue_drop)
+        revenue_loss = self.revenue - rev
+        added_interest = self.total_debt * rate_hike
+        ni = self.net_income - revenue_loss - added_interest
+        
+        current_ratio = self.current_assets / self.current_liabilities if self.current_liabilities else 0
+        quick_ratio = (self.current_assets - self.inventory) / self.current_liabilities if self.current_liabilities else 0
+        debt_to_equity = self.total_liabilities / self.total_equity if self.total_equity else 0
+        net_profit_margin = ni / rev if rev else 0
+        roa = ni / self.total_assets if self.total_assets else 0
+
+        x1 = self.working_capital / self.total_assets if self.total_assets else 0
+        x2 = self.retained_earnings / self.total_assets if self.total_assets else 0
+        x3 = self.ebit / self.total_assets if self.total_assets else 0
+        x4 = self.total_equity / self.total_liabilities if self.total_liabilities else 0
+        x5 = rev / self.total_assets if self.total_assets else 0
+        
+        z_score = (0.717 * x1) + (0.847 * x2) + (3.107 * x3) + (0.420 * x4) + (0.998 * x5)
+
+        return {
+            "Current Ratio": current_ratio,
+            "Quick Ratio": quick_ratio,
+            "Debt-to-Equity": debt_to_equity,
+            "Net Profit Margin": net_profit_margin,
+            "ROA": roa,
+            "Altman Z-Score": z_score
+        }
+
+    def calculate_bankability(self, ratios):
+        score = 0
+        if ratios["Current Ratio"] >= 1.5: score += 20
+        elif ratios["Current Ratio"] >= 1.0: score += 10
+        
+        if 0 < ratios["Debt-to-Equity"] <= 1.5: score += 20
+        elif 1.5 < ratios["Debt-to-Equity"] <= 2.5: score += 10
+        
+        if ratios["Net Profit Margin"] >= 0.10: score += 20
+        elif ratios["Net Profit Margin"] > 0.0: score += 10
+        
+        if ratios["ROA"] >= 0.05: score += 20
+        elif ratios["ROA"] > 0.0: score += 10
+        
+        if ratios["Altman Z-Score"] > 2.9: score += 20
+        elif ratios["Altman Z-Score"] > 1.23: score += 10
+        
+        return score
+
+    def get_risk_classification(self, score):
+        if score >= 80: return "Low Risk", "Highly Ready for Loan processing."
+        elif score >= 50: return "Moderate Risk", "Requires collateral or structural review."
+        else: return "High Risk", "Not recommended for standard lending at this time."
 
 # ==========================================
-# 3. PERFORMANCE & STATE OPTIMIZATION
+# 3. REPORT GENERATOR
+# ==========================================
+class ReportGenerator:
+    @staticmethod
+    def generate_pdf(company_name, score, risk, rec, ratios):
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(200, 10, txt=f"MSME Financial Health Report: {company_name}", ln=True, align='C')
+        
+        pdf.set_font("Arial", size=12)
+        pdf.ln(10)
+        pdf.cell(200, 10, txt=f"Bankability Score: {score}/100", ln=True)
+        pdf.cell(200, 10, txt=f"Risk Classification: {risk}", ln=True)
+        pdf.cell(200, 10, txt=f"Recommendation: {rec}", ln=True)
+        
+        pdf.ln(10)
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(200, 10, txt="Key Financial Metrics:", ln=True)
+        pdf.set_font("Arial", size=12)
+        
+        for metric, value in ratios.items():
+            pdf.cell(200, 10, txt=f"{metric}: {value:.2f}", ln=True)
+            
+        return pdf.output(dest='S').encode('latin-1')
+
+# ==========================================
+# 4. PERFORMANCE & STATE OPTIMIZATION
 # ==========================================
 @st.cache_data(show_spinner="Parsing Financials...")
 def load_excel_data(file):
@@ -94,12 +176,11 @@ def init_session():
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
         st.session_state.username = ""
-        st.session_state.is_paid = False
 
 # ==========================================
-# 4. STREAMLIT UI & NAVIGATION
+# 5. STREAMLIT UI & NAVIGATION
 # ==========================================
-st.set_page_config(page_title="MSME Scanner PRO", layout="wide")
+st.set_page_config(page_title="MSME Scanner", layout="wide")
 db = get_db_connection()
 init_session()
 
@@ -114,11 +195,9 @@ if not st.session_state.logged_in:
         l_user = st.text_input("Username", key="l_user")
         l_pass = st.text_input("Password", type="password", key="l_pass")
         if st.button("Login"):
-            auth_data = db.verify_user(l_user, l_pass)
-            if auth_data["authenticated"]:
+            if db.verify_user(l_user, l_pass):
                 st.session_state.logged_in = True
                 st.session_state.username = l_user
-                st.session_state.is_paid = auth_data["is_paid"]
                 st.rerun()
             else:
                 st.error("Invalid credentials.")
@@ -131,45 +210,88 @@ if not st.session_state.logged_in:
                 st.success("Account created! Please log in.")
             else:
                 st.error("Username already exists.")
-    st.stop() # Halt execution here if not logged in
+    st.stop() 
 
 # --- MAIN APPLICATION UI ---
 st.sidebar.title(f"Welcome, {st.session_state.username}")
-if st.session_state.is_paid:
-    st.sidebar.success("PRO Member")
-else:
-    st.sidebar.warning("Free Member")
 
-page = st.sidebar.radio("Navigation", ["Scanner Dashboard", "Scan History", "Upgrade to PRO"])
+page = st.sidebar.radio("Navigation", ["Scanner Dashboard", "Scan History"])
 
 if st.sidebar.button("Logout"):
     st.session_state.logged_in = False
     st.session_state.username = ""
-    st.session_state.is_paid = False
     st.rerun()
 
 # --- PAGE: SCANNER DASHBOARD ---
 if page == "Scanner Dashboard":
     st.title("MSME Financial Health Scanner")
-    # ... [Insert your existing file upload and gauge chart UI here] ...
+    st.markdown("Upload your structured Excel file to analyze balance sheets and P&L statements.")
     
-    # Example Paywall implementation inside your results block:
-    # After generating base_score, risk_level, rec, base_ratios:
+    company_name = st.text_input("Company Name")
+    uploaded_file = st.file_uploader("Upload Financial Data (Excel)", type=["xlsx", "xls"])
     
-    st.markdown("---")
-    st.subheader("Actions")
-    
-    # Anyone can save
-    # if st.button("Save Results to Database"):
-    #    db.save_scan(st.session_state.username, company_name, base_score, risk_level)
-    
-    # Paywall for PDF
-    if st.session_state.is_paid:
-        # pdf_bytes = ReportGenerator.generate_pdf(...)
-        # st.download_button(label="Download PDF Report", data=pdf_bytes, file_name=f"report.pdf", mime="application/pdf")
-        st.success("Download unlocked.")
-    else:
-        st.info("🔒 Premium Feature. Please upgrade to download full PDF reports.")
+    if uploaded_file and company_name:
+        try:
+            df = load_excel_data(uploaded_file)
+            
+            if 'current_file' not in st.session_state or st.session_state.current_file != uploaded_file.name:
+                engine = FinancialEngine(df)
+                st.session_state.base_ratios = engine.calculate_ratios()
+                st.session_state.base_score = engine.calculate_bankability(st.session_state.base_ratios)
+                st.session_state.risk_level, st.session_state.rec = engine.get_risk_classification(st.session_state.base_score)
+                
+                st.session_state.stress_ratios = engine.calculate_ratios(apply_stress=True, revenue_drop=0.10, rate_hike=0.02)
+                st.session_state.stress_score = engine.calculate_bankability(st.session_state.stress_ratios)
+                st.session_state.current_file = uploaded_file.name
+            
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.subheader("Bankability Score")
+                fig = go.Figure(go.Indicator(
+                    mode = "gauge+number",
+                    value = st.session_state.base_score,
+                    domain = {'x': [0, 1], 'y': [0, 1]},
+                    title = {'text': st.session_state.risk_level},
+                    gauge = {
+                        'axis': {'range': [None, 100]},
+                        'bar': {'color': "darkblue"},
+                        'steps': [
+                            {'range': [0, 49], 'color': "red"},
+                            {'range': [50, 79], 'color': "yellow"},
+                            {'range': [80, 100], 'color': "green"}],
+                    }
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+                st.info(f"**Recommendation:** {st.session_state.rec}")
+            
+            with col2:
+                st.subheader("Key Ratios & Metrics")
+                metrics_df = pd.DataFrame(list(st.session_state.base_ratios.items()), columns=["Metric", "Value"])
+                metrics_df["Value"] = metrics_df["Value"].round(2)
+                st.dataframe(metrics_df, hide_index=True, use_container_width=True)
+                
+            st.markdown("---")
+            st.subheader("Stress Test Simulation")
+            st.markdown("Simulate a **10% revenue drop** and a **2% interest rate increase**.")
+            st.metric("Stress-Tested Score", value=f"{st.session_state.stress_score}/100", 
+                      delta=f"{st.session_state.stress_score - st.session_state.base_score} pts", delta_color="normal")
+            
+            st.markdown("---")
+            st.subheader("Actions")
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                if st.button("Save Results to Database"):
+                    db.save_scan(st.session_state.username, company_name, st.session_state.base_score, st.session_state.risk_level)
+                    st.success("Scan saved successfully!")
+            
+            with col_b:
+                pdf_bytes = ReportGenerator.generate_pdf(company_name, st.session_state.base_score, st.session_state.risk_level, st.session_state.rec, st.session_state.base_ratios)
+                st.download_button(label="Download PDF Report", data=pdf_bytes, file_name=f"{company_name}_report.pdf", mime="application/pdf")
+                
+        except Exception as e:
+            st.error(f"Error processing file. Please ensure it matches the required format. Details: {e}")
 
 # --- PAGE: SCAN HISTORY ---
 elif page == "Scan History":
@@ -179,44 +301,3 @@ elif page == "Scan History":
         st.dataframe(history_df, hide_index=True, use_container_width=True)
     else:
         st.write("No scan history found.")
-
-# --- PAGE: UPGRADE TO PRO (RAZORPAY) ---
-elif page == "Upgrade to PRO":
-    st.title("Upgrade to PRO")
-    
-    if st.session_state.is_paid:
-        st.success("You are already a PRO member. Enjoy unlimited PDF downloads!")
-    else:
-        st.markdown("""
-        ### Unlock Full Reporting
-        1. **Pay ₹999** via our secure Razorpay link.
-        2. Copy your **Payment ID** (starts with `pay_...`) from the receipt.
-        3. Paste it below to instantly unlock your account.
-        """)
-        
-        # Replace with your actual Razorpay Payment Link
-        st.markdown("[👉 **Click Here to Pay via Razorpay**](https://rzp.io/l/your_payment_link_here)")
-        
-        st.markdown("---")
-        payment_id = st.text_input("Enter your Razorpay Payment ID:")
-        
-        if st.button("Verify & Upgrade"):
-            if not payment_id.startswith("pay_"):
-                st.error("Invalid Payment ID format.")
-            else:
-                try:
-                    # Initialize Razorpay Client (Use Streamlit Secrets in production)
-                    # client = razorpay.Client(auth=(st.secrets["rzp_key_id"], st.secrets["rzp_key_secret"]))
-                    
-                    # Simulated Verification for prototype
-                    # payment = client.payment.fetch(payment_id)
-                    # if payment['status'] == 'captured':
-                    
-                    # For now, we will assume validation passed if it starts with 'pay_'
-                    db.upgrade_user(st.session_state.username)
-                    st.session_state.is_paid = True
-                    st.success("Payment Verified! You are now a PRO member.")
-                    st.rerun()
-                        
-                except Exception as e:
-                    st.error(f"Payment verification failed: {e}")
