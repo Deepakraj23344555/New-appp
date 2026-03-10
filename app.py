@@ -159,8 +159,9 @@ class ReportGenerator:
         for metric, value in ratios.items():
             pdf.cell(200, 10, txt=f"{metric}: {value:.2f}", ln=True)
             
-        return pdf.output(dest='S').encode('latin-1')
-
+        # FIX: fpdf2 returns a bytearray natively, so we just convert it to bytes for Streamlit
+        return bytes(pdf.output())
+        
 # ==========================================
 # 4. PERFORMANCE & STATE OPTIMIZATION
 # ==========================================
